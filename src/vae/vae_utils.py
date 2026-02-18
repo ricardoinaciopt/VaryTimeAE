@@ -83,20 +83,8 @@ def instantiate_vae_model(
     return vae
 
 
-def train_vae(vae, train_data, max_epochs, verbose=0):
-    """
-    Train a VAE model.
-
-    Args:
-        vae (Union[VAE_Dense, VAE_Conv, TimeVAE]): The VAE model to train.
-        train_data (np.ndarray): The training data which must be of shape
-                                 [num_samples, window_len, feature_dim].
-        max_epochs (int, optional): The maximum number of epochs to train
-                                    the model.
-                                    Defaults to 100.
-        verbose (int, optional): Verbose arg for keras model.fit()
-    """
-    vae.fit_on_data(train_data, max_epochs, verbose)
+def train_vae(vae, train_data, max_epochs, verbose=0, train_mask=None):
+    vae.fit_on_data(train_data, max_epochs, verbose, train_mask=train_mask)
 
 
 def save_vae_model(vae, dir_path: str) -> None:

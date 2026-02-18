@@ -49,7 +49,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.encoder = None
         self.decoder = None
 
-    def fit_on_data(self, train_data, max_epochs=1000, verbose=0):
+    def fit_on_data(self, train_data, max_epochs=1000, verbose=0, train_mask=None):
         loss_to_monitor = "total_loss"
         early_stopping = EarlyStopping(
             monitor=loss_to_monitor, min_delta=1e-2, patience=50, mode="min"
@@ -57,12 +57,20 @@ class BaseVariationalAutoencoder(Model, ABC):
         reduce_lr = ReduceLROnPlateau(
             monitor=loss_to_monitor, factor=0.5, patience=30, mode="min"
         )
+
+        sample_weight = None
+        if train_mask is not None:
+            sample_weight = train_mask
+            if sample_weight.ndim == 3 and sample_weight.shape[-1] == 1:
+                sample_weight = sample_weight[..., 0]  # (N, T)
+
         self.fit(
             train_data,
             epochs=max_epochs,
             batch_size=self.batch_size,
             callbacks=[early_stopping, reduce_lr],
             verbose=verbose,
+            sample_weight=sample_weight,
         )
 
     def call(self, X):
@@ -103,38 +111,42 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.encoder.summary()
         self.decoder.summary()
 
-    def _get_reconstruction_loss(self, X, X_recons):
-        def get_reconst_loss_by_axis(X, X_c, axis):
-            x_r = tf.reduce_mean(X, axis=axis)
-            x_c_r = tf.reduce_mean(X_recons, axis=axis)
-            err = tf.math.squared_difference(x_r, x_c_r)
-            loss = tf.reduce_sum(err)
-            return loss
+    def _get_reconstruction_loss(self, X, X_recons, sample_weight=None):
+        err = tf.math.squared_difference(X, X_recons)  # (B,T,F)
 
-        # overall
-        err = tf.math.squared_difference(X, X_recons)
-        reconst_loss = tf.reduce_sum(err)
+        if sample_weight is None:
+            per_sample = tf.reduce_mean(err, axis=[1, 2])  # (B,)
+            return tf.reduce_mean(per_sample)
 
-        reconst_loss += get_reconst_loss_by_axis(X, X_recons, axis=[2])  # by time axis
-        # reconst_loss += get_reconst_loss_by_axis(X, X_recons, axis=[1])    # by feature axis
-        return reconst_loss
+        M = tf.cast(sample_weight, err.dtype)  # (B,T)
+        M = M[..., None]  # (B,T,1)
+        num = tf.reduce_sum(err * M, axis=[1, 2])  # (B,)
+        den = tf.reduce_sum(M, axis=[1, 2]) + 1e-8  # (B,)
+        per_sample = num / den
+        return tf.reduce_mean(per_sample)
 
-    def train_step(self, X):
+    def train_step(self, data):
+        X, _, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+
+        if sample_weight is not None:
+            X = X * tf.cast(sample_weight[..., None], X.dtype)
+
         with tf.GradientTape() as tape:
-            z_mean, z_log_var, z = self.encoder(X)
+            z_mean, z_log_var, z = self.encoder(X, training=True)
 
-            reconstruction = self.decoder(z)
+            z = z_mean
 
-            reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
+            reconstruction = self.decoder(z, training=True)
 
-            kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            kl_loss = tf.reduce_sum(tf.reduce_sum(kl_loss, axis=1))
-            # kl_loss = kl_loss / self.latent_dim
+            reconstruction_loss = self._get_reconstruction_loss(
+                X, reconstruction, sample_weight
+            )
+
+            kl_loss = tf.constant(0.0, dtype=reconstruction_loss.dtype)
 
             total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
-
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
 
         self.total_loss_tracker.update_state(total_loss)
@@ -147,15 +159,20 @@ class BaseVariationalAutoencoder(Model, ABC):
             "kl_loss": self.kl_loss_tracker.result(),
         }
 
-    def test_step(self, X):
-        z_mean, z_log_var, z = self.encoder(X)
-        reconstruction = self.decoder(z)
-        reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
+    def test_step(self, data):
+        X, _, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
 
-        kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        kl_loss = tf.reduce_sum(tf.reduce_sum(kl_loss, axis=1))
-        # kl_loss = kl_loss / self.latent_dim
+        if sample_weight is not None:
+            X = X * tf.cast(sample_weight[..., None], X.dtype)
 
+        z_mean, z_log_var, z = self.encoder(X, training=False)
+        z = z_mean
+        reconstruction = self.decoder(z, training=False)
+
+        reconstruction_loss = self._get_reconstruction_loss(
+            X, reconstruction, sample_weight
+        )
+        kl_loss = tf.constant(0.0, dtype=reconstruction_loss.dtype)
         total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
 
         self.total_loss_tracker.update_state(total_loss)

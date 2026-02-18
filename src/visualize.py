@@ -1,64 +1,139 @@
 import matplotlib.pyplot as plt
 import os
-import pandas as pd, numpy as np
+import numpy as np
 from sklearn.manifold import TSNE
-from typing import Optional
 
 TITLE_FONT_SIZE = 16
 
 
-def plot_samples(
-    samples1: np.ndarray,
+def avg_over_dim(data: np.ndarray, axis: int) -> np.ndarray:
+    return np.mean(data, axis=axis)
+
+
+def plot_random_orig_recon_grid(
+    X,
+    Xrec,
+    mask,
+    *,
+    nrows=2,
+    ncols=5,
+    feature=0,
+    seed=0,
+    sharey=False,
+    title="Random original vs reconstruction",
+):
+    X = np.asarray(X)
+    Xrec = np.asarray(Xrec)
+    mask = np.asarray(mask)
+
+    N = X.shape[0]
+    rng = np.random.default_rng(seed)
+    idxs = rng.choice(N, size=nrows * ncols, replace=False)
+
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(3.6 * ncols, 2.8 * nrows), sharey=sharey
+    )
+    axes = np.asarray(axes).reshape(-1)
+
+    for ax, i in zip(axes, idxs):
+        m = mask[i, :, 0].astype(bool)
+        if not np.any(m):
+            ax.set_title(f"idx={i} (empty mask)")
+            ax.axis("off")
+            continue
+        last = np.where(m)[0][-1] + 1
+
+        ax.plot(X[i, :last, feature], label="orig")
+        ax.plot(Xrec[i, :last, feature], label="recon", alpha=0.85)
+        ax.set_title(f"idx={i}, len={last}")
+        ax.grid(True, alpha=0.15)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    fig.suptitle(title, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.show()
+
+
+def to_masked_fixed_length_vectors(x: np.ndarray, m: np.ndarray, K: int) -> np.ndarray:
+    if m.ndim == 3:
+        m = m[..., 0]
+    m = m.astype(bool)
+
+    N, T, F = x.shape
+    out = np.zeros((N, K), dtype=np.float32)
+
+    for i in range(N):
+        valid = x[i, m[i], 0]  # univariate
+        if valid.size == 0:
+            continue
+        L = min(valid.size, K)
+        out[i, :L] = valid[:L]
+    return out
+
+
+def visualize_and_save_tsne_latent_pairs(
+    z1: np.ndarray,
     samples1_name: str,
-    samples2: Optional[np.ndarray] = None,
-    samples2_name: Optional[str] = None,
-    num_samples: int = 5,
+    z2: np.ndarray,
+    samples2_name: str,
+    scenario_name: str,
+    save_dir: str,
+    max_samples: int = 1000,
+    perplexity_max: int = 40,
+    n_iter: int = 600,
+    seed: int = 42,
+    draw_pair_lines: bool = True,
 ) -> None:
     """
-    Plot one or two sets of samples.
-
-    Args:
-        samples1 (np.ndarray): The first set of samples to plot.
-        samples1_name (str): The name for the first set of samples in the plot title.
-        samples2 (Optional[np.ndarray]): The second set of samples to plot.
-                                         Defaults to None.
-        samples2_name (Optional[str]): The name for the second set of samples in the
-                                       plot title.
-                                       Defaults to None.
-        num_samples (int, optional): The number of samples to plot.
-                                     Defaults to 5.
-
-    Returns:
-        None
+    t-SNE on latent embeddings (N,D) for two aligned sets (same N).
+    Draws optional lines connecting each pair i: (z1_i -> z2_i).
     """
-    if samples2 is not None:
-        fig, axs = plt.subplots(num_samples, 2, figsize=(10, 6))
-    else:
-        fig, axs = plt.subplots(num_samples, 1, figsize=(6, 8))
+    if z1.shape[0] != z2.shape[0]:
+        raise ValueError("z1 and z2 must have the same number of samples.")
+    if z1.ndim != 2 or z2.ndim != 2:
+        raise ValueError("z1 and z2 must be 2D arrays: (N,D).")
+    if z1.shape[1] != z2.shape[1]:
+        raise ValueError("z1 and z2 must have the same embedding dimension.")
 
-    for i in range(num_samples):
-        rnd_idx1 = np.random.choice(len(samples1))
-        sample1 = samples1[rnd_idx1]
+    used = min(z1.shape[0], max_samples)
+    Z = np.vstack([z1[:used], z2[:used]])  # (2*used, D)
 
-        if samples2 is not None:
-            rnd_idx2 = np.random.choice(len(samples2))
-            sample2 = samples2[rnd_idx2]
+    n_points = Z.shape[0]
+    perplexity = min(perplexity_max, max(5, (n_points - 1) // 3))
 
-            axs[i, 0].plot(sample1)
-            axs[i, 0].set_title(samples1_name)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        n_iter=n_iter,
+        random_state=seed,
+        init="pca",
+        learning_rate="auto",
+    )
+    Y = tsne.fit_transform(Z)
 
-            axs[i, 1].plot(sample2)
-            axs[i, 1].set_title(samples2_name)
-        else:
-            axs[i].plot(sample1)
-            axs[i].set_title(samples1_name)
+    y1 = Y[:used]
+    y2 = Y[used:]
 
-    if samples2 is not None:
-        fig.suptitle(f"{samples1_name} vs {samples2_name}", fontsize=TITLE_FONT_SIZE)
-    else:
-        fig.suptitle(samples1_name, fontsize=TITLE_FONT_SIZE)
+    plt.figure(figsize=(8, 8))
+    plt.scatter(y1[:, 0], y1[:, 1], label=samples1_name, alpha=0.55, s=40)
+    plt.scatter(y2[:, 0], y2[:, 1], label=samples2_name, alpha=0.55, s=40)
 
-    fig.tight_layout()
+    if draw_pair_lines:
+        for i in range(used):
+            plt.plot(
+                [y1[i, 0], y2[i, 0]], [y1[i, 1], y2[i, 1]], alpha=0.15, linewidth=0.7
+            )
+
+    plt.title(f"t-SNE (latent) for {scenario_name}")
+    plt.legend()
+
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(
+        os.path.join(save_dir, f"{scenario_name}_latent_tsne.png"),
+        dpi=200,
+        bbox_inches="tight",
+    )
     plt.show()
 
 
@@ -94,96 +169,4 @@ def plot_latent_space_samples(vae, n: int, figsize: tuple) -> None:
 
     fig.suptitle("Generated Samples From 2D Embedded Space", fontsize=TITLE_FONT_SIZE)
     fig.tight_layout()
-    plt.show()
-
-
-def avg_over_dim(data: np.ndarray, axis: int) -> np.ndarray:
-    """
-    Average over the feature dimension of the data.
-
-    Args:
-        data (np.ndarray): The data to average over.
-        axis (int): Axis to average over.
-
-    Returns:
-        np.ndarray: The data averaged over the feature dimension.
-    """
-    return np.mean(data, axis=axis)
-
-
-def visualize_and_save_tsne(
-    samples1: np.ndarray,
-    samples1_name: str,
-    samples2: np.ndarray,
-    samples2_name: str,
-    scenario_name: str,
-    save_dir: str,
-    max_samples: int = 1000,
-) -> None:
-    """
-    Visualize the t-SNE of two sets of samples and save to file.
-
-    Args:
-        samples1 (np.ndarray): The first set of samples to plot.
-        samples1_name (str): The name for the first set of samples in the plot title.
-        samples2 (np.ndarray): The second set of samples to plot.
-        samples2_name (str): The name for the second set of samples in the
-                             plot title.
-        scenario_name (str): The scenario name for the given samples.
-        save_dir (str): Dir path to which to save the file.
-        max_samples (int): Maximum number of samples to use in the plot. Samples should
-                           be limited because t-SNE is O(n^2).
-    """
-    if samples1.shape != samples2.shape:
-        raise ValueError(
-            "Given pairs of samples dont match in shapes. Cannot create t-SNE.\n"
-            f"sample1 shape: {samples1.shape}; sample2 shape: {samples2.shape}"
-        )
-
-    samples1_2d = avg_over_dim(samples1, axis=2)
-    samples2_2d = avg_over_dim(samples2, axis=2)
-
-    # num of samples used in the t-SNE plot
-    used_samples = min(samples1_2d.shape[0], max_samples)
-
-    # Combine the original and generated samples
-    combined_samples = np.vstack(
-        [samples1_2d[:used_samples], samples2_2d[:used_samples]]
-    )
-
-    # Compute the t-SNE of the combined samples
-    tsne = TSNE(n_components=2, perplexity=40, n_iter=300, random_state=42)
-    tsne_samples = tsne.fit_transform(combined_samples)
-
-    # Create a DataFrame for the t-SNE samples
-    tsne_df = pd.DataFrame(
-        {
-            "tsne_1": tsne_samples[:, 0],
-            "tsne_2": tsne_samples[:, 1],
-            "sample_type": [samples1_name] * used_samples
-            + [samples2_name] * used_samples,
-        }
-    )
-
-    # Plot the t-SNE samples
-    plt.figure(figsize=(8, 8))
-    for sample_type, color in zip([samples1_name, samples2_name], ["red", "blue"]):
-        if sample_type is not None:
-            indices = tsne_df["sample_type"] == sample_type
-            plt.scatter(
-                tsne_df.loc[indices, "tsne_1"],
-                tsne_df.loc[indices, "tsne_2"],
-                label=sample_type,
-                color=color,
-                alpha=0.5,
-                s=100,
-            )
-
-    plt.title(f"t-SNE for {scenario_name}")
-    plt.legend()
-
-    # Save the plot to a file
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, f"{scenario_name}.png"))
-
     plt.show()

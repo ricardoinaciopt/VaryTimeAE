@@ -263,10 +263,8 @@ class TimeVAE(BaseVariationalAutoencoder):
 
     def save(self, model_dir: str):
         os.makedirs(model_dir, exist_ok=True)
-        super().save(model_dir)  # Save common parameters and weights
+        super().save(model_dir)
 
-        # self.custom_seas is a Keras TrackedList, need to convert it
-        # back to list of tuples so it is serializable
         if self.custom_seas is not None:
             custom_seas_serializable = [
                 (int(num_seasons), int(len_per_season))

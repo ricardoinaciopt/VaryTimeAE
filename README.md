@@ -1,20 +1,167 @@
-# TimeVAE for Synthetic Timeseries Data Generation
+# VaryTimeAE: Variable-Length Time Series Variants with Masked Reconstruction + Latent Perturbations
 
-TimeVAE is a model designed for generating synthetic time-series data using a Variational Autoencoder (VAE) architecture with interpretable components like level, trend, and seasonality. This repository includes the implementation of TimeVAE, as well as two baseline models: a dense VAE and a convolutional VAE.
+This repository is based on the **TimeVAE** implementation by Abhishek Udesai:  
+https://github.com/abudesai/timeVAE
 
-## Paper Reference
+It adapts the original codebase to support **variable-length** time series and to generate $N$ variants per input series (data augmentation), rather than unconditional generation from a learned prior.
 
-For a detailed explanation of the methodology, see the paper: [TIMEVAE: A VARIATIONAL AUTO-ENCODER FOR
-MULTIVARIATE TIME SERIES GENERATION](https://arxiv.org/abs/2111.08095).
+For the original methodology and architectural motivation (including the level/trend/seasonality decoder components), see the TimeVAE paper:  
+**TIMEVAE: A VARIATIONAL AUTO-ENCODER FOR MULTIVARIATE TIME SERIES GENERATION**  
+https://arxiv.org/abs/2111.08095
 
-## Project Information
+---
 
-This project implements the Variational Autoencoder architecture with modifications to the decoder to include interpretable components of time-series data: level, trend, and seasonality. Additionally, it provides two other baseline models:
+## What stays the same (baseline TimeVAE components)
 
-- **Dense VAE**: A simple VAE with dense layers in the encoder and decoder.
-- **Convolutional VAE**: A VAE with convolutional layers in the encoder and decoder, referred to as the base model in the paper.
+VaryTimeAE inherits the original design choices from TimeVAE:
 
-See `./src/vae/` for the implementation of these models. Note that `vae_base.py` contains an abstract superclass and does not represent TimeVAE-Base.
+- A sequence encoder/decoder VAE-style architecture implemented in `./src/vae/`.
+- TimeVAE’s optional *interpretable decoder* decomposition (level, trend, seasonality, residual connection) when enabled via hyperparameters.
+- Baseline model variants:
+  - <s>**Dense VAE** (`vae_dense_model.py`)</s> **UNCHANGED**
+  - <s>**Convolutional VAE** (`vae_conv_model.py`): “base model” in the paper</s> **UNCHANGED**
+  - **TimeVAE** (`timevae.py`): with optional interpretable decoder components
+- Training utilities and pipeline structure (instantiate/train/save/visualize).
+
+---
+
+## What changes in VaryTimeAE
+
+### 1) Variable-length handling via padding + mask
+
+Real datasets often contain series with different lengths. We batch them by padding to a common maximum length  $T$, and we store a binary mask  $m$:
+
+-  $x \in \mathbb{R}^{T \times F}$: padded series
+-  $m \in \{0,1\}^{T \times 1}$: mask (1 = observed timestep, 0 = padded)
+
+All learning and evaluation is performed only on observed positions.
+
+---
+
+### 2) Mask-aware scaling
+
+Scaling must not treat padding as data. We fit/transform using only observed values and then explicitly zero padded points in scaled space:
+
+$
+x^{scaled} \leftarrow \text{Scale}(x \mid m), \qquad
+x^{scaled} \leftarrow x^{scaled} \odot m
+$
+
+This prevents padded tails from leaking into the model as a spurious pattern.
+
+---
+
+### 3) Training objective: masked reconstruction 
+
+**Key change:** we train in **autoencoder mode**, optimizing only a masked reconstruction loss.
+
+Forward pass:
+1. Mask input:  $\tilde{x} = x \odot m$  
+2. Encode:  $z = \mathrm{Enc}(\tilde{x})$  
+3. Decode:  $\hat{x} = \mathrm{Dec}(z)$  
+4. Mask output:  $\hat{x} \leftarrow \hat{x} \odot m$
+
+Masked MSE loss:
+$\mathcal{L}_{rec}=\frac{\sum_{t=1}^{T} m_t \lVert x_t - \hat{x}_t\rVert^2}{\sum_{t=1}^{T} m_t}$
+
+**Difference vs TimeVAE:**  
+TimeVAE trains with a VAE objective:
+$\mathcal{L}_{VAE}=\mathcal{L}_{rec} + \beta \,\mathrm{KL}(q_\phi(z|x)\,\|\,p(z))$
+which encourages  $q(z|x)$ to align with a global prior  $p(z)=\mathcal{N}(0,I)$, enabling meaningful **prior sampling**.
+
+In **AE-mode**, the KL term is removed, because the goal here is:
+- high-fidelity reconstruction for each series
+- controlled, *input-conditioned* variant generation
+
+---
+
+## Reconstruction and Variant Generation
+
+### Reconstruction
+
+A reconstruction is:
+$
+\hat{x} = \mathrm{Dec}(\mathrm{Enc}(x \odot m)) \odot m
+$
+
+This is used for sanity checks and for measuring reconstruction quality (masked MSE).
+
+---
+
+### Variant generation
+
+We generate  $N$ variants per original series by sampling locally around its latent code:
+
+1) Encode each series:
+$
+z_i = \mathrm{Enc}(x_i \odot m_i)
+$
+
+2) Perturb latent code:
+$
+z_{i,k} = z_i + \alpha_i \,\varepsilon_{i,k}, \qquad k=1,\dots,N
+$
+
+3) Decode and mask output:
+$
+x^{var}_{i,k} = \mathrm{Dec}(z_{i,k}) \odot m_i
+$
+
+This yields variants that are close to each original series (fidelity) while not being identical (diversity).
+
+---
+
+## Two quality improvements used in VaryTimeAE 
+
+### Adaptive noise scale per series
+
+To keep variants similar across series, we scale  $\alpha$ using per-series reconstruction error  $e_i$:
+
+$\alpha_i = \alpha \cdot \sqrt{\frac{e_i}{\mathrm{median}(e)}} \quad \text{(clipped)}$
+
+This avoids over-perturbing smooth series and under-perturbing noisy series.
+
+---
+
+### Anisotropic latent noise
+
+Instead of isotropic noise  $\varepsilon \sim \mathcal{N}(0,I)$, estimate latent covariance  $\Sigma$ from encoded latents and sample:
+
+$
+\varepsilon \sim \mathcal{N}(0,\Sigma)
+$
+
+using Cholesky factorization  $\Sigma = LL^\top$:
+$
+\varepsilon = \eta L^\top, \qquad \eta \sim \mathcal{N}(0,I)
+$
+
+This perturbs latents along realistic dataset directions, improving plausibility.
+
+---
+
+## Prior vs Posterior in AE-mode
+
+Because **AE-mode removes KL**, the latent space is **not constrained** to match a known prior distribution (e.g.,  $\mathcal{N}(0,I)$). Therefore:
+
+- **Prior sampling**  $z \sim \mathcal{N}(0,I)$ is not guaranteed to produce valid samples.
+- Generation is **conditional**: variants are drawn around the encoded latent $z_i$ of each series.
+
+---
+
+## Practical outputs
+
+Given $N$ input series and a chosen $N_{variants}:
+
+- Reconstructions: $(\hat{x}_i)$ for each input $(x_i)$
+- Variants: $(x^{var}_{i,k})$ for $k=1..N_{variants}$
+
+Outputs are saved under:
+- `./outputs/models/<dataset_name>/`
+- `./outputs/gen_data/<dataset_name>/`
+- `./outputs/tsne/<dataset_name>/`
+
+---
 
 ## Project Structure
 
@@ -22,169 +169,95 @@ See `./src/vae/` for the implementation of these models. Note that `vae_base.py`
 TimeVAE/
 ├── data/                         # Folder for datasets
 ├── outputs/                      # Folder for model outputs
-│   ├── gen_data/                 # Folder for generated samples
+│   ├── gen_data/                 # Folder for generated samples / variants
 │   ├── models/                   # Folder for model artifacts
 │   └── tsne/                     # Folder for t-SNE plots
 ├── src/                          # Source code
 │   ├── config/                   # Configuration files
 │   │   └── hyperparameters.yaml  # Hyperparameters settings
-│   ├── vae/                      # VAE models implementation
-│   │   ├── timevae.py            # Main TimeVAE model
-│   │   ├── vae_base.py           # Abstract superclass
-│   │   ├── vae_conv_model.py     # Convolutional VAE model (base model)
+│   ├── vae/                      # VAE models implementation (VaryTimeAE)
+│   │   ├── timevae.py            # adapted TimeVAE model 
+│   │   ├── vae_base.py           # Base class; modified for masked AE-mode
+│   │   ├── vae_conv_model.py     # Convolutional VAE model (paper base model)
 │   │   ├── vae_dense_model.py    # Dense VAE model
-│   │   └── vae_utils.py          # utils to create, train, and use VAE models
-│   ├── data_utils.py             # utils for data loading, splitting and scaling
-│   ├── paths.py                  # path variables for config file, data, models, and outputs
-│   ├── vae_pipeline.py           # Main pipeline script
-│   └── visualize.py              # Scripts for visualization, including t-SNE plots
-├── LICENSE.md                    # License information
-├── README.md                     # Readme file
-└── requirements.txt              # Dependencies
-
+│   │   └── vae_utils.py          # instantiate/train/save/load utilities
+│   ├── data_utils.py             # load/scale logic (mask-aware scaling added)
+│   ├── paths.py                  # path variables
+│   ├── vae_pipeline.py           # main pipeline script (variants generation)
+│   └── visualize.py              # visualization (incl. latent t-SNE for pairs)
+├── LICENSE.md
+├── README.md
+└── requirements.txt
 ```
+
+---
 
 ## Installation
 
-Create a virtual environment and install dependencies:
-
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Usage (Variants per Original)
 
-1. **Prepare Data**: Save your data as a numpy array with shape `(n_samples, n_timesteps, n_features)` in the `./data/` folder in `.npz` format. The filename without the extension will be used as the dataset name (e.g., `my_data.npz` will be referred to as `my_data`). Alternatively, use one of the existing datasets provided in the `./data/` folder.
+1. **Prepare the Dataset**: Place your dataset in `./data/` as an `.npz` file containing:
+    * `data`: Array shaped (N, T, F) (padded).
+    * `mask`: Array shaped (N, T, 1) (1 for observed, 0 for padding).
+    * `lengths` (optional): True lengths per series.
 
-2. **Configure Pipeline**:
+2. **Configure Pipeline**: Set the `dataset` and `model_name` in `./src/vae_pipeline.py`:
+   ```python
+   dataset = "m3_m"
+   model_name = "timeVAE"
+   ```
 
-   - Update the dataset name and model type in `./src/vae_pipeline.py`:
-     ```python
-     dataset = "my_data"  # Your dataset name
-     model_name = "timeVAE"  # Choose between vae_dense, vae_conv, or timeVAE
-     ```
-   - Set hyperparameters in `./src/config/hyperparameters.yaml`. Key hyperparameters include `latent_dim`, `hidden_layer_sizes`, `reconstruction_wt`, and `batch_size`.
-
-3. **Run the Script**:
-
+3. **Execute**: Run the following command in your terminal:
    ```bash
    python src/vae_pipeline.py
    ```
 
-4. **Outputs**:
-   - Trained models are saved in `./outputs/models/<dataset_name>/`.
-   - Generated synthetic data is saved in `./outputs/gen_data/<dataset_name>/` in `.npz` format.
-   - t-SNE plots are saved in `./outputs/tsne/<dataset_name>/` in `.png` format.
+---
 
-## Hyperparameters
+## Converting long CSV data to `.npz` (Notebook: `convert_long_npz.ipynb`)
 
-The four key hyperparameters for the VAE models are:
+This repository expects datasets in **`.npz` format** with at least:
+- `data`: padded array of shape **(N, T, F)**
+- `mask`: binary mask of shape **(N, T, 1)** indicating observed timesteps
+- `lengths`: true lengths per series (**(N, )**)
 
-- `latent_dim`: Number of latent dimensions (default: 8).
-- `hidden_layer_sizes`: Number of hidden units or filters (default: [50, 100, 200]).
-- `reconstruction_wt`: Weight for the reconstruction loss (default: 3.0).
-- `batch_size`: Training batch size (default: 16).
+To convert a **long-format CSV** with columns **(`unique_id`, `ds`, `y`)** into the required `.npz` format, use the notebook:
 
-For `timeVAE`:
+**`convert_long_npz.ipynb`**
 
-- `trend_poly`: Degree of polynomial trend component (default: 0).
-- `custom_seas`: Custom seasonalities as a list of tuples (default: null).
-- `use_residual_conn`: Use residual connection (default: true).
+### What it does
+Given a long dataframe:
+- Groups rows by `unique_id`
+- Sorts by timestamp `ds`
+- Pads all series to the maximum length `T`
+- Creates a mask \(m_t\) with 1s for observed values and 0s for padded tail
+- Saves a compressed `.npz` file containing: `data`, `mask`, `lengths`, and metadata (`unique_id`, `ds_list`)
 
-> The default settings for the timeVAE model set it to operate as the base model without interpretable components.
+### Where to place the converted datasets
 
-**Note**  
-The default hyperparameters in the `./src/config/hyperparameters.yaml` file have been identified after extensive testing on numerous datasets and tend to perform well on most datasets. However, you may want to tune these hyperparameters for your specific dataset.
+The pipeline looks for datasets under /data. After conversion, move or copy the resulting files:
 
-## FAQs
+```bash
+cp npz_data_converted/*.npz data/
+```
 
-### Data Structure and Format
+---
 
-#### How do I format my time series data for TimeVAE?
+## Pipeline Outputs
 
-The model expects data to be a 3D numpy array of shape (N, T, D). The load function is looking for a .npz file, but you can replace that logic with your own data loading mechanism.
+* **Models**: `./outputs/models/<dataset_name>/`
+* **Variants**: `./outputs/gen_data/<dataset_name>/`
+* **t-SNE Plots**: `./outputs/tsne/<dataset_name>/`
 
-#### What if I have a single series of length T and dimension D? How do I convert to 3-dimensional data?
+---
 
-Generate windows from your series of length T' where T' < T. Each window becomes a sample in your dataset, creating the N dimension. For example, if you have a time series of length 1000 and you create windows of length 100, you could generate up to 901 windows (with overlap).
+## Acknowledgements
 
-#### What's the N in the 3D arrays needed to train the model?
-
-N represents the number of samples or windows generated from your time series. If you have multiple series, you can generate windows from each series and combine them.
-
-#### What if I have multiple series?
-
-You can generate windows from each series and combine them into a single dataset. Make sure each series has the same dimensionality D.
-
-#### What if I have univariate series?
-
-That's fine - the data would still need to be reshaped to be (N, T, D) where D = 1. Simply add an extra dimension to your data.
-
-#### What if I have multivariate series?
-
-TimeVAE naturally handles multivariate time series. Your data shape will be (N, T, D) where D is the number of variables or features in your multivariate series.
-
-#### How do I choose the window length?
-
-This depends on your specific use case - what sized samples are you looking to generate. Two key factors to consider:
-
-1. **Quality of generated samples**: In general, more samples means better quality of generated data, but also longer samples (but not unnecessarily lengthy) improve quality. Since these are counteracting, you need to pick the window length that gives the best balance.
-2. **Application requirements**: Consider what length of synthetic time series you need for your downstream applications.
-
-For example, if your data is at daily frequency and has weekly patterns (day-of-week effects), your window length should be at least 7 time steps to capture one full cycle. However, for best results, you might want to use 3-4 weeks (21-28 time steps) to ensure the model properly learns the weekly patterns. Similarly, if you need to generate monthly forecasts, you would want longer windows to ensure the model learns longer-term dependencies.
-
-#### Can TimeVAE handle missing values?
-
-The current implementation doesn't explicitly handle missing values. You would need to preprocess your data to fill in missing values before using TimeVAE.
-
-#### What's the minimum amount of data needed?
-
-This depends on the complexity of patterns in your data and your tolerance for exactly matching patterns in the underlying data. Generally, more complex seasonal patterns or trends require more data. As a rule of thumb, aim for at least a few hundred windows.
-
-### Model Parameters and Configuration
-
-#### How do I choose custom_seas parameters?
-
-Currently, we haven't yet provided an automated solution for this. The original intent for authors was to inject domain knowledge into the model - in this case, users would specify parameters based on known seasonality in their data.
-
-For example, if your data has hourly frequency, you might use `[7, 24]` to represent 7 days with 24 hours each. If your data has daily frequency, you might use `[7, 1]` to represent weekday patterns and `[12,30]` for annual seasonality patterns.
-
-#### How do I choose trend_poly?
-
-The `trend_poly` parameter controls the order of polynomial used to model trends. Set it to 0 for no trend modeling, 1 for linear trends, 2 for quadratic trends, etc. Higher values capture more complex trend patterns but may lead to overfitting.
-
-### Evaluation and Usage
-
-#### How do I evaluate if my synthetic data is good?
-
-The paper presents two primary methods:
-
-1. **Visual inspection**: Visualize t-SNE of original and synthetic data to check if they look similar. This is admittedly subjective but good for sanity checks.
-2. **Downstream task performance**: Build models using original vs. synthetic data, and check performance on held-out original data. For example, you could train forecasting models on both datasets and compare their prediction accuracy.
-
-#### How do I evaluate quality of latent space?
-
-This is tricky. In the end, the quality of latent space is best judged by evaluating the quality of generated synthetic samples. See the response to the question above about evaluating synthetic data quality.
-
-You can also check for smoothness in the latent space by generating samples from interpolated points in the latent space and seeing if they produce smooth transitions in the generated data.
-
-#### Can I use TimeVAE for forecasting?
-
-Yes - you can use the underlying methodology - although we are not sure if it can be called TimeVAE in this context.
-
-See these repositories for implementations focused on forecasting:
-
-- https://github.com/readytensor/rt_forecasting_variational_encoder_pytorch
-- https://github.com/readytensor/rt_forecasting_var_enc_fcst_w_pretraining
-
-## License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
-
-## Contact Information
-
-For any inquiries or collaborations, please contact the lead author at: `<lead_author_first_name>.<lead_author_last_name>@gmail.com`.
-
-See the paper for author details.
+* **Base Implementation**: [abudesai/timeVAE](https://github.com/abudesai/timeVAE)
+* **Paper**: [TimeVAE: A Variational Auto-Encoder for Multivariate Time Series Generation](https://arxiv.org/abs/2111.08095)
